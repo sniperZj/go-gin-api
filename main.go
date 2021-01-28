@@ -3,59 +3,82 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/gin-contrib/pprof"
-	"github.com/gin-gonic/gin"
-	"go-gin-api/app/config"
-	"go-gin-api/app/route"
-	"log"
 	"net/http"
-	"os"
-	"os/signal"
 	"time"
+
+	"github.com/xinliangnote/go-gin-api/configs"
+	"github.com/xinliangnote/go-gin-api/internal/api/router"
+	"github.com/xinliangnote/go-gin-api/internal/pkg/cache"
+	"github.com/xinliangnote/go-gin-api/internal/pkg/db"
+	"github.com/xinliangnote/go-gin-api/pkg/logger"
+	"github.com/xinliangnote/go-gin-api/pkg/shutdown"
+
+	"go.uber.org/zap"
 )
 
+// @title go-gin-api docs api
+// @version
+// @description
+
+// @contact.name
+// @contact.url
+// @contact.email
+
+// @license.name MIT
+// @license.url https://github.com/xinliangnote/go-gin-api/blob/master/LICENSE
+
+// @host 127.0.0.1:9999
+// @BasePath
 func main() {
-	gin.SetMode(config.AppMode)
-	engine := gin.New()
+	// 初始化日志
+	loggers, err := logger.NewJSONLogger(
+		logger.WithField("domain", configs.ProjectName()),
+		logger.WithTimeLayout("2006-01-02 15:04:05"),
+		logger.WithFileP(fmt.Sprintf("./logs/%s-access.log", configs.ProjectName())),
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer loggers.Sync()
 
-	// 性能分析 - 正式环境不要使用！！！
-	pprof.Register(engine)
-
-	// 设置路由
-	route.SetupRouter(engine)
-
-	server := &http.Server{
-		Addr         : config.AppPort,
-		Handler      : engine,
-		ReadTimeout  : config.AppReadTimeout * time.Second,
-		WriteTimeout : config.AppWriteTimeout * time.Second,
+	// 初始化数据库
+	dbRepo, err := db.New()
+	if err != nil {
+		loggers.Fatal("new db err", zap.Error(err))
 	}
 
-	fmt.Println("|-----------------------------------|")
-	fmt.Println("|            go-gin-api             |")
-	fmt.Println("|-----------------------------------|")
-	fmt.Println("|  Go Http Server Start Successful  |")
-	fmt.Println("|    Port" + config.AppPort + "     Pid:" + fmt.Sprintf("%d", os.Getpid()) + "        |")
-	fmt.Println("|-----------------------------------|")
-	fmt.Println("")
+	// 初始化缓存
+	cacheRepo, err := cache.New()
+	if err != nil {
+		loggers.Fatal("new cache err", zap.Error(err))
+	}
+
+	// 初始化 HTTP 服务
+	mux, err := router.NewHTTPMux(loggers, dbRepo, cacheRepo)
+	if err != nil {
+		panic(err)
+	}
+
+	server := &http.Server{
+		Addr:    configs.ProjectPort(),
+		Handler: mux,
+	}
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server listen: %s\n", err)
+			loggers.Fatal("http server startup err", zap.Error(err))
 		}
 	}()
 
-	// 等待中断信号以优雅地关闭服务器（设置 5 秒的超时时间）
-	signalChan := make(chan os.Signal)
-	signal.Notify(signalChan, os.Interrupt)
-	sig := <-signalChan
-	log.Println("Get Signal:", sig)
-	log.Println("Shutdown Server ...")
+	// 优雅关闭
+	shutdown.NewHook().Close(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatal("Server Shutdown:", err)
-	}
-	log.Println("Server exiting")
+		if err := server.Shutdown(ctx); err != nil {
+			loggers.Fatal("shutdown err", zap.Error(err))
+		} else {
+			loggers.Info("shutdown success")
+		}
+	})
 }
